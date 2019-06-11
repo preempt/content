@@ -82,6 +82,7 @@ script:
     ''' HELPER FUNCTIONS '''
     def api_request(uri, data):
         data = {} if data is None else data
+        clean_veriables(data["variables"])
         LOG("running request with url=%s\tdata=%s" % (uri, data))
         try:
             res = requests.post(uri,
@@ -94,6 +95,34 @@ script:
             raise
         return res
 
+    def clean_veriables(veriables):
+        keys_to_delete = [key for key in veriables if not veriables[key]]
+        for key in keys_to_delete:
+            del veriables[key]
+
+    def api_request_pagenated(uri, data, query_name):
+        data = {} if data is None else data
+        results = []
+        has_next = True
+        clean_veriables(data["variables"])
+        while has_next:
+            LOG("running request with url=%s\tdata=%s" % (uri, data))
+            try:
+                res = requests.post(uri,
+                                    verify=USE_SSL,
+                                    json=data,
+                                    headers=AUTH_HEADER)
+                if res.status_code not in (200, 204):
+                    raise Exception('Your request failed with the following error: ' + res.reason)
+            except Exception, e:
+                raise
+            resp = res.json()["data"][query_name]
+            has_next = resp["pageInfo"]["hasNextPage"]
+            cursor = resp["edges"][-1]["cursor"] if resp["edges"] else None
+            for edge in resp["edges"]:
+                results.append(edge["node"])
+        return {"res": results, "cursor": cursor}
+
     TIMELINE_LIMIT = 1000
 
     def datetime_to_iso(d):
@@ -101,60 +130,53 @@ script:
 
     def get_alerts(start_time=None, end_time=None, cursor=None, types=None, source_user_id=None):
         query = """
-    query ($cursor: Cursor, $startTime: DateTimeInput, $endTime: DateTimeInput, $types: [String!], $sourceUserId: UUID) {
-      timeline(types: [ALERT], limit: %d, alertQuery: {types: $types}, sourceEntityQuery: {id: $sourceUserId}, startTime: $startTime, endTime: $endTime, after: $cursor) {
-        cursor
-        eventId
-        timestamp
-        ... on TimelineAlertEvent {
-          incident {
-            severity
-            _id
-            state {
-              lifeCycleStage
+    query ($cursor: Cursor, $startTime: DateTimeInput, $endTime: DateTimeInput, $types: [AlertType!], $sourceUserId: [UUID!]) {
+      timeline(types: [ALERT], first: %d, alertQuery: {types: $types}, sourceEntityQuery: {entityIds: $sourceUserId}, startTime: $startTime, endTime: $endTime, after: $cursor) {
+        edges
+        {
+          cursor
+          node
+          {
+            eventId
+            timestamp
+            ... on TimelineAlertEvent
+            {
+              incident
+              {
+                severity
+                incidentId
+                lifeCycleStage
+              }
+              alertType
+              timestamp
+              startTime
+              endTime
+              eventLabel
+              userEntity
+              {
+                entityId
+                primaryDisplayName
+                accounts
+                {
+                  ... on ActiveDirectoryAccountDescriptor
+                  {
+                    samAccountName
+                    domain
+                    upn
+                  }
+                }
+              }
+              endpointEntity
+              {
+                entityId
+                hostName
+              }
             }
-          }
-          alertType
-          timestamp
-          startTime
-          endTime
-          eventLabel
-          userEntity {
-            _id
-            primaryDisplayName
-            primaryAccount {
-              samAccountName
-              domain
-              upn
             }
-          }
-          endpointEntity {
-            _id
-            hostName
-          }
         }
-        relatedEvents(startTime: $startTime, limit: 30, types: [SUCCESSFUL_AUTHENTICATION, SERVICE_ACCESS], open: true) {
-          eventType
-          timestamp
-          ... on TimelineAuthenticationEvent {
-            authenticationType
-            geoLocation {
-              cityCode
-              countryCode
-              latitude
-              longitude
-            }
-            ipAddress
-          }
-          ... on TimelineServiceAccessEvent {
-            geoLocation {
-              countryCode
-              country
-              latitude
-              longitude
-            }
-            ipAddress
-          }
+        pageInfo
+        {
+          hasNextPage
         }
       }
     }
@@ -167,16 +189,56 @@ script:
             "query": query, "variables": variables
         }
 
-        resp = api_request(GRAPHQL_URI, data)
-        alerts = resp.json()["data"]["timeline"]
+        alerts = api_request_pagenated(GRAPHQL_URI, data, "timeline")
 
         return alerts
 
+    def get_related_geo_events(event_id, start_time=None):
+        query = """
+        query($startTime: DateTimeInput, $eventId: EventId!)
+        {
+          timeline(startTime: $startTime, first: 30, types: [SUCCESSFUL_AUTHENTICATION, SERVICE_ACCESS], open: true, relatedTo:$eventId)
+          {
+            nodes
+            {
+              eventType
+              timestamp
+              ... on TimelineAuthenticationEvent {
+                authenticationType
+                geoLocation {
+                  cityCode
+                  countryCode
+                  latitude
+                  longitude
+                }
+                ipAddress
+              }
+              ... on TimelineServiceAccessEvent {
+                geoLocation {
+                  countryCode
+                  country
+                  latitude
+                  longitude
+                }
+                ipAddress
+              }
+            }
+          }
+        }
+        """
+        variables = {
+            "startTime": start_time, "eventId": event_id
+        }
+        data = {
+            "query": query, "variables": variables
+        }
+        res = api_request(GRAPHQL_URI, data)
+        return res.json()["data"]["timeline"]["nodes"]
 
     # The command demisto.command() holds the command sent from the user.
     if demisto.command() == "test-module":
         # This is the call made when pressing the integration test button.
-        query = "{ aomActivities(limit: 1) { _id } }"
+        query = "{ timeline(first:1) { nodes { eventId } } }"
         variables = {}
         data = {
             "query": query, "variables": variables
@@ -188,32 +250,34 @@ script:
     if demisto.command() == "fetch-incidents":
         cursor = demisto.getLastRun().get("cursor")
 
-        alerts = get_alerts(cursor=cursor,
+        res = get_alerts(cursor=cursor,
                             start_time=datetime.utcnow() - LOOKBACK,
                             end_time=datetime.utcnow(),
                             types=["GeoLocationAnomalyAlert", "ForbiddenCountryAlert"])
 
+        alerts = res["res"]
         fixed_alerts = []
         # Retrieve geo-location data and external IP from the first relevant activity and put it on the alert JSON
         for alert in alerts:
             # Only interested in LOW or MEDIUM severity incidents
-            if alert["incident"]["severity"] not in ["LOW", "MEDIUM"] or alert["incident"]["state"]["lifeCycleStage"] != "NEW":
+            if alert["incident"]["severity"] not in ["LOW", "MEDIUM"] or alert["incident"]["lifeCycleStage"] != "NEW":
                 continue
 
             alert_start_time = parse_date(alert["startTime"])
             try:
-                access = next(event for event in alert["relatedEvents"] if parse_date(event["timestamp"]) >= alert_start_time and event["geoLocation"])
+                related_events = get_related_geo_events(alert["eventId"], alert["startTime"])
+                access = next(event for event in related_events if parse_date(event["timestamp"]) >= alert_start_time and event["geoLocation"])
                 for field in ["geoLocation", "ipAddress"]:
                     alert[field] = access[field]
                 fixed_alerts.append(alert)
             except StopIteration, e:
                 pass
 
-        result = [{"Name": "Incident %s" % alert["eventId"], "rawJSON": json.dumps(alert)} for alert in fixed_alerts]
+        result = [{"Name": "Incident %s" % alert["incident"]["incidentId"], "rawJSON": json.dumps(alert)} for alert in fixed_alerts]
 
         # Store the cursor
         demisto.setLastRun({
-            "cursor": alerts[-1]["cursor"] if alerts else cursor
+            "cursor": res["cursor"] if alerts and res["cursor"] else cursor
         })
 
         # lastRun is a dictionary, with value "now" for key "time".
@@ -223,44 +287,108 @@ script:
 
     if demisto.command() == "preempt-add-to-watch-list":
         # The Preempt API receives the same parameters as the command
-        args = {
-            "entityIds": [demisto.args()["accountObjectGuid"]]
+        query = """
+        mutation watchSomeUser
+    {
+      addEntitiesToWatchList(input: { entityQuery: {entityIds:["%s"] } })
+      {
+        updatedEntities
+        {
+          primaryDisplayName
+          secondaryDisplayName
+          watched
         }
-        resp = api_request("%s/watch" % ENTITIES_URI, args)
-        demisto.results("User added to watch list")
+        failures
+        {
+          entityIds
+          errorDetails
+          {
+            message
+          }
+        }
+      }
+    }
+        """ % demisto.args()["accountObjectGuid"]
+
+        data = {"query": query, "variables": {}}
+        res = api_request(GRAPHQL_URI, data)
+        results = res.json()["data"]["addEntitiesToWatchList"]
+        if results["updatedEntities"]:
+            demisto.results("User added to watch list")
+        else:
+            demisto.results("Failed to add entity to watch list")
         sys.exit(0)
 
     if demisto.command() == "preempt-remove-from-watch-list":
         # The Preempt API receives the same parameters as the command
-        args = {
-            "entityIds": [demisto.args()["accountObjectGuid"]]
-        }
-        resp = api_request("%s/unwatch" % ENTITIES_URI, args)
-        demisto.results("User removed from watch list")
+            query = """
+            mutation unwatchSomeUser {
+              removeEntitiesFromWatchList(input:{entityQuery:{entityIds:["%s"]}})
+              {
+                updatedEntities
+                {
+                  primaryDisplayName
+                  secondaryDisplayName
+                  watched
+                }
+                failures
+                {
+                  entityIds
+                  errorDetails
+                  {
+                    message
+                  }
+                }
+              }
+            }""" % demisto.args()["accountObjectGuid"]
+
+        data = {"query": query, "variables": {}}
+        res = api_request(GRAPHQL_URI, data)
+        results = res.json()["data"]["removeEntitiesFromWatchList"]
+        if results["updatedEntities"]:
+            demisto.results("Entity removed from watch list")
+        else:
+            demisto.results("Failed to remove entity from watch list")
         sys.exit(0)
 
     if demisto.command() == "preempt-get-activities":
         query = """
-    query ($cursor: Cursor, $startTime: DateTimeInput,  $endTime: DateTimeInput, $types: [TimelineEventType!], $authTypes: [AuthenticationType!], $sourceUserId: UUID) {
-      timeline(limit: %d, types: $types, sourceEntityQuery: {id: $sourceUserId}, activityQuery: {authenticationTypes: $authTypes}, startTime: $startTime, endTime: $endTime, after: $cursor) {
-        cursor
-        timestamp
-        eventType
-        ... on TimelineSuccessfulAuthenticationEvent {
-          authenticationType
-          endpointEntity {
-            primaryDisplayName
-            hostName
-          }
-          userEntity {
-            _id
-            primaryDisplayName
-            primaryAccount {
-              samAccountName
-              domain
-              upn
+    query ($cursor: Cursor, $startTime: DateTimeInput,  $endTime: DateTimeInput, $types: [TimelineEventType!], $authTypes: [AuthenticationType!], $sourceUserId: [UUID!])
+    {
+      timeline(first: %d, types: $types, sourceEntityQuery: {entityIds: $sourceUserId}, activityQuery: {authenticationTypes: $authTypes}, startTime: $startTime, endTime: $endTime, after: $cursor)
+      {
+        edges
+        {
+          cursor
+          node
+          {
+            timestamp
+            eventType
+            ... on TimelineSuccessfulAuthenticationEvent {
+              authenticationType
+              endpointEntity {
+                primaryDisplayName
+                hostName
+              }
+              userEntity {
+                entityId
+                primaryDisplayName
+                accounts
+                {
+                  ... on ActiveDirectoryAccountDescriptor
+                  {
+                    samAccountName
+                    domain
+                    upn
+                  }
+                }
+              }
             }
           }
+        }
+        pageInfo
+        {
+          hasNextPage
         }
       }
     }
@@ -288,11 +416,11 @@ script:
         data = {
             "query": query, "variables": variables
         }
-        resp = api_request(GRAPHQL_URI, data)
+        resp = api_request_pagenated(GRAPHQL_URI, data, "timeline")
 
-        events = resp.json()["data"]["timeline"]
+        events = resp["res"]
 
-        cursor = events[-1]["cursor"] if len(events) == TIMELINE_LIMIT else None
+        cursor = resp["cursor"] if len(events) == TIMELINE_LIMIT and resp["cursor"] else None
 
         def prettyfy_result(res):
             return {
@@ -317,18 +445,26 @@ script:
 
     if demisto.command() == "preempt-get-user-endpoints":
         query = """
-    query ($sourceUserId: UUID!) {
-      entities(id: $sourceUserId) {
-        associations(bindingTypes: [LOGIN, OWNERSHIP]) {
-          bindingType
-          ... on OriginAssociation {
-            entityId
-            entity {
-              primaryDisplayName
-              ... on EndpointEntity {
-                hostName
-                lastIpAddress
-                staticIpAddresses
+    query ($sourceUserId: [UUID!]) {
+      entities(entityIds:$sourceUserId, first:1)
+      {
+        nodes
+        {
+          associations(bindingTypes: [LOGIN, OWNERSHIP])
+          {
+              bindingType
+              ... on OriginAssociation
+            {
+              entity
+              {
+                entityId
+                  primaryDisplayName
+                ... on EndpointEntity
+                {
+                  hostName
+                  lastIpAddress
+                  staticIpAddresses
+                }
               }
             }
           }
@@ -346,17 +482,17 @@ script:
 
         resp = api_request(GRAPHQL_URI, data)
         # Only associations are necessary. Add a flag to mark if it is ownership
-        entities = resp.json()["data"]["entities"]
+        entities = resp.json()["data"]["entities"]["nodes"]
         if entities:
             entity = entities[0]
-            ownedEndpointsId = [assoc["entityId"] for assoc in entity["associations"] if assoc["bindingType"] == "OWNERSHIP"]
-            result = [dict(assoc, isOwned=(assoc["entityId"] in ownedEndpointsId)) for assoc in entity["associations"] if assoc["bindingType"] == "LOGIN"]
+            ownedEndpointsId = [assoc["entity"]["entityId"] for assoc in entity["associations"] if assoc["bindingType"] == "OWNERSHIP"]
+            result = [dict(assoc, isOwned=(assoc["entity"]["entityId"] in ownedEndpointsId)) for assoc in entity["associations"] if assoc["bindingType"] == "LOGIN"]
         else:
             result = []
 
         def prettyfy_result(endpoint):
             return {
-                "Id": endpoint["entityId"],
+                "Id": endpoint["entity"]["entityId"],
                 "HostName": endpoint["entity"]["hostName"],
                 "PrimaryDisplayName": endpoint["entity"]["primaryDisplayName"],
                 "IsOwnedByUser": endpoint["isOwned"],
@@ -382,13 +518,14 @@ script:
         dt_end_time = parse_date(end_time) if end_time else datetime.utcnow()
         last_hours = int(demisto.args().get("numOfHours"))
 
-
-        alerts = get_alerts(cursor=demisto.args().get("cursor"),
+        resp = get_alerts(cursor=demisto.args().get("cursor"),
                             start_time=dt_end_time - timedelta(hours=last_hours),
                             end_time=dt_end_time,
                             source_user_id=demisto.args().get("sourceUserId"))
 
-        cursor = alerts[-1]["cursor"] if len(alerts) == TIMELINE_LIMIT else None
+        alerts = resp["res"]
+
+        cursor = resp["cursor"] if len(alerts) == TIMELINE_LIMIT and resp["cursor"] else None
 
         demisto.results({
             "Type": 1,
@@ -499,3 +636,4 @@ script:
     description: Get the alerts generated according to given arguments
   dockerimage: demisto/python
   isfetch: true
+  runonce: false
