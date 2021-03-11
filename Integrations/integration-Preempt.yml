@@ -321,7 +321,7 @@ script:
 
     if demisto.command() == "preempt-remove-from-watch-list":
         # The Preempt API receives the same parameters as the command
-            query = """
+        query = """
             mutation unwatchSomeUser {
               removeEntitiesFromWatchList(input:{entityQuery:{entityIds:["%s"]}})
               {
@@ -392,7 +392,7 @@ script:
         }
       }
     }
-    """ % TIMELINE_LIMIT
+        """ % TIMELINE_LIMIT
 
         types = []
         auth_types = []
@@ -400,14 +400,16 @@ script:
             if t == "LOGIN":
                 types.append("SUCCESSFUL_AUTHENTICATION")
                 auth_types.append("DOMAIN_LOGIN")
+            else:
+                types.append(t)
 
         end_time = demisto.args().get("endTime")
         dt_end_time = parse_date(end_time) if end_time else datetime.utcnow()
         last_hours = int(demisto.args().get("numOfHours"))
 
         variables = dict({key: demisto.args().get(key) for key in ["sourceUserId"]},
-                         start_time=datetime_to_iso(dt_end_time - timedelta(hours=last_hours)),
-                         end_time=datetime_to_iso(dt_end_time),
+                         startTime=datetime_to_iso(dt_end_time - timedelta(hours=last_hours)),
+                         endTime=datetime_to_iso(dt_end_time),
                          types=(types or None),
                          authTypes=(auth_types or None))
 
@@ -425,9 +427,9 @@ script:
         def prettyfy_result(res):
             return {
                 "EventType": res["eventType"],
-                "AuthenticationType": res["authenticationType"],
+                "AuthenticationType": res.get("authenticationType", None),
                 "Timestamp": res["timestamp"],
-                "EndpointHostName": res["endpointEntity"]["hostName"]
+                "EndpointHostName": res["endpointEntity"]["hostName"] if "endpointEntity" in res else None
             }
         pretty_results = map(prettyfy_result, events)
 
@@ -493,11 +495,11 @@ script:
         def prettyfy_result(endpoint):
             return {
                 "Id": endpoint["entity"]["entityId"],
-                "HostName": endpoint["entity"]["hostName"],
+                "HostName": endpoint["entity"].get("hostName", None),
                 "PrimaryDisplayName": endpoint["entity"]["primaryDisplayName"],
                 "IsOwnedByUser": endpoint["isOwned"],
-                "LastIpAddress": endpoint["entity"]["lastIpAddress"],
-                "StaticIpAddresses": endpoint["entity"]["staticIpAddresses"]
+                "LastIpAddress": endpoint["entity"].get("lastIpAddress", None),
+                "StaticIpAddresses": endpoint["entity"].get("staticIpAddresses", [])
             }
 
         pretty_results = map(prettyfy_result, result)
@@ -567,19 +569,14 @@ script:
     outputs:
     - contextPath: Preempt.Activities.EndpointHostName
       description: Hostname of the activity's endpoint
-      type: string
     - contextPath: Preempt.Activities.EventType
       description: Type of the activity
-      type: string
     - contextPath: Preempt.Activities.AuthenticationType
       description: For authentication, specific type
-      type: string
     - contextPath: Preempt.Activities.Timestamp
       description: Date/time of the activity
-      type: date
     - contextPath: Preempt.Activities.Cursor
       description: Cursor of last retrieved activity for pagination
-      type: string
     description: Get activities from a time frame
   - name: preempt-get-user-endpoints
     arguments:
@@ -589,22 +586,16 @@ script:
     outputs:
     - contextPath: Endpoint.Hostname
       description: Hostname of the endpoint
-      type: string
     - contextPath: Endpoint.ID
       description: Object GUID of the computer account
-      type: string
     - contextPath: Endpoint.PrimaryDisplayName
       description: The computer's display name in AD
-      type: string
     - contextPath: Endpoint.IsOwnedByUser
       description: True if the user owns this endpoint
-      type: boolean
     - contextPath: Endpoint.IPAddress
       description: The last IP address associated with this endpoint seen by the system
-      type: string
     - contextPath: Endpoint.StaticIpAddresses
       description: Static IP addresses which have been associated with the endpoint
-      type: string
     description: Gets the endpoints regularly used by the user account
   - name: preempt-get-alerts
     arguments:
@@ -618,22 +609,16 @@ script:
     outputs:
     - contextPath: Preempt.Alerts.AlertType
       description: Type of the Alert
-      type: string
     - contextPath: Preempt.Alerts.timestamp
       description: Date/time of the activity
-      type: date
     - contextPath: Preempt.Alerts.startTime
       description: Date/time of beginning of the alert
-      type: date
     - contextPath: Preempt.Alerts.EndTime
       description: Date/time when the alert was ended
-      type: date
     - contextPath: Preempt.Alerts.eventLabel
       description: The label of the alert
-      type: string
     - contextPath: Preempt.Alerts.Cursor
       description: Cursor of last retrieved activity for pagination
     description: Get the alerts generated according to given arguments
   dockerimage: demisto/python
   isfetch: true
-  runonce: false
